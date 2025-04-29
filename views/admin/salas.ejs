@@ -303,22 +303,46 @@
         // Função para editar uma sala
         async function editarSala(id) {
             try {
+                console.log('Iniciando edição da sala:', id);
+                const token = localStorage.getItem('token');
+                console.log('Token:', token);
+                
                 const response = await fetch(`/api/salas/${id}`, {
                     headers: {
-                        'Authorization': `Bearer ${localStorage.getItem('token')}`
+                        'Authorization': `Bearer ${token}`
                     }
                 });
                 
+                console.log('Status da resposta:', response.status);
+                
                 if (!response.ok) {
+                    const errorData = await response.json();
+                    console.error('Erro da API:', errorData);
                     throw new Error('Erro ao carregar dados da sala');
                 }
                 
                 const sala = await response.json();
+                console.log('Dados da sala:', sala);
+                
                 document.getElementById('salaId').value = sala.id;
                 document.getElementById('nomeSala').value = sala.nome;
                 document.getElementById('capacidadeSala').value = sala.capacidade;
                 
-                const recursos = sala.recursos ? sala.recursos.split(',') : [];
+                // Converter recursos para array se for string
+                let recursos = sala.recursos;
+                console.log('Recursos antes do processamento:', recursos);
+                
+                if (typeof recursos === 'string') {
+                    try {
+                        recursos = JSON.parse(recursos);
+                    } catch (e) {
+                        recursos = recursos.split(',');
+                    }
+                }
+                
+                console.log('Recursos processados:', recursos);
+                
+                // Marcar os checkboxes corretamente
                 document.getElementById('projetor').checked = recursos.includes('projetor');
                 document.getElementById('arCondicionado').checked = recursos.includes('ar_condicionado');
                 document.getElementById('internet').checked = recursos.includes('internet');
@@ -326,7 +350,7 @@
                 document.getElementById('modalTitle').textContent = 'Editar Sala';
                 new bootstrap.Modal(document.getElementById('modalSala')).show();
             } catch (error) {
-                console.error('Erro:', error);
+                console.error('Erro completo:', error);
                 alert('Erro ao carregar dados da sala. Por favor, tente novamente.');
             }
         }

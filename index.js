@@ -11,11 +11,13 @@ import jwt from 'jsonwebtoken'
 import bcrypt from 'bcryptjs'
 import cookieParser from 'cookie-parser'
 import session from 'express-session'
+import nodemailer from 'nodemailer'
 
 const { Pool } = pkg
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
+// Carregar variáveis de ambiente
 dotenv.config()
 
 const app = express()
@@ -40,6 +42,7 @@ app.set('layout', 'layout')
 app.use(cors())
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+app.use(express.static('public'))
 app.use(cookieParser())
 app.use(session({
   secret: process.env.JWT_SECRET,
@@ -53,6 +56,15 @@ app.use(session({
 
 // Swagger UI
 app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(specs))
+
+// Configuração do nodemailer para envio de e-mails
+const transporter = nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS
+    }
+});
 
 // Rota inicial
 app.get('/', (req, res) => {
@@ -69,33 +81,75 @@ app.get('/', (req, res) => {
   }
 })
 
-// Middleware de autenticação
-const verificarToken = (req, res, next) => {
-  const token = req.session?.token || req.headers.authorization?.split(' ')[1] || req.cookies?.token
-  if (!token) {
-    return res.redirect('/login')
-  }
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET)
-    console.log('Token decodificado:', decoded) // Debug
-    req.user = {
-      id: decoded.id,
-      tipo: decoded.tipo
-    }
-    next()
-  } catch (error) {
-    console.error('Erro ao verificar token:', error) // Debug
-    return res.redirect('/login')
-  }
-}
+// Rota de logout
+app.get('/logout', (req, res) => {
+    // Limpar a sessão
+    req.session.destroy((err) => {
+        if (err) {
+            console.error('Erro ao fazer logout:', err);
+        }
+        // Limpar o cookie
+        res.clearCookie('token');
+        // Redirecionar para a página de login
+        res.redirect('/login');
+    });
+});
 
 // Middleware para verificar autenticação em todas as rotas protegidas
-app.use((req, res, next) => {
-  if (req.path === '/login' || req.path === '/registro' || req.path === '/esqueci-senha' || req.path.startsWith('/api/auth/')) {
-    return next()
-  }
-  verificarToken(req, res, next)
-})
+app.use(async (req, res, next) => {
+    // Rotas públicas que não precisam de autenticação
+    const publicRoutes = [
+        '/login',
+        '/registro',
+        '/esqueci-senha',
+        '/redefinir-senha',
+        '/api/auth/login',
+        '/api/auth/registro',
+        '/api/auth/recuperar-senha',
+        '/api/auth/redefinir-senha'
+    ];
+
+    if (publicRoutes.includes(req.path)) {
+        return next();
+    }
+
+    const token = req.session?.token || req.headers.authorization?.split(' ')[1] || req.cookies?.token;
+    
+    if (!token) {
+        return res.redirect('/login');
+    }
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        
+        // Buscar informações do usuário no banco de dados
+        const userResult = await pool.query(
+            'SELECT id, nome, matricula, email, tipo_usuario FROM usuarios WHERE id = $1',
+            [decoded.id]
+        );
+        
+        if (userResult.rows.length === 0) {
+            return res.redirect('/login');
+        }
+
+        // Adicionar o usuário ao objeto de requisição
+        req.user = {
+            id: userResult.rows[0].id,
+            nome: userResult.rows[0].nome,
+            matricula: userResult.rows[0].matricula,
+            email: userResult.rows[0].email,
+            tipo: userResult.rows[0].tipo_usuario
+        };
+
+        // Passar o usuário para todas as views
+        res.locals.user = req.user;
+        
+        next();
+    } catch (error) {
+        console.error('Erro ao verificar token:', error);
+        return res.redirect('/login');
+    }
+});
 
 // Rotas de autenticação
 app.post('/api/auth/login', async (req, res) => {
@@ -203,40 +257,100 @@ app.post('/api/auth/registro', async (req, res) => {
 })
 
 app.post('/api/auth/recuperar-senha', async (req, res) => {
-  const { matricula, email } = req.body
-  try {
-    // Verificar se usuário existe
-    const result = await pool.query(
-      'SELECT * FROM usuarios WHERE matricula = $1 AND email = $2',
-      [matricula, email]
-    )
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Usuário não encontrado' })
+    try {
+        const { matricula, email } = req.body;
+        
+        // Buscar usuário no banco de dados
+        const result = await pool.query(
+            'SELECT * FROM usuarios WHERE matricula = $1 AND email = $2',
+            [matricula, email]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(400).json({ error: 'Usuário não encontrado' });
+        }
+
+        const user = result.rows[0];
+
+        // Gerar token de recuperação
+        const token = jwt.sign(
+            { id: user.id },
+            process.env.JWT_SECRET || 'chave_secreta_temporaria',
+            { expiresIn: '1h' }
+        );
+
+        // Criar link de recuperação
+        const resetLink = `${process.env.BASE_URL || 'http://localhost:3001'}/redefinir-senha?token=${token}`;
+
+        // Configurar e-mail
+        const mailOptions = {
+            from: process.env.EMAIL_USER,
+            to: email,
+            subject: 'Recuperação de Senha - Sistema de Reservas',
+            html: `
+                <h1>Recuperação de Senha</h1>
+                <p>Olá ${user.nome},</p>
+                <p>Você solicitou a recuperação de senha. Clique no link abaixo para redefinir sua senha:</p>
+                <p><a href="${resetLink}">Redefinir Senha</a></p>
+                <p>Este link expira em 1 hora.</p>
+                <p>Se você não solicitou esta recuperação, ignore este e-mail.</p>
+            `
+        };
+
+        // Enviar e-mail
+        await transporter.sendMail(mailOptions);
+        console.log('E-mail de recuperação enviado com sucesso');
+
+        res.json({ message: 'E-mail de recuperação enviado com sucesso' });
+    } catch (error) {
+        console.error('Erro ao processar recuperação de senha:', error);
+        res.status(500).json({ error: 'Erro ao processar recuperação de senha' });
     }
+});
 
-    // Gerar token de recuperação
-    const token = jwt.sign(
-      { id: result.rows[0].id, tipo: 'recuperacao' },
-      'seu_segredo_jwt',
-      { expiresIn: '1h' }
-    )
+// Rota para exibir a página de redefinição de senha
+app.get('/redefinir-senha', (req, res) => {
+    const { token } = req.query;
+    if (!token) {
+        return res.redirect('/esqueci-senha');
+    }
+    res.render('redefinir-senha', { token });
+});
 
-    // TODO: Enviar email com link de recuperação
-    // Por enquanto, apenas retornamos o token
-    res.json({ message: 'Email de recuperação enviado' })
-  } catch (error) {
-    console.error('Erro ao recuperar senha:', error)
-    res.status(500).json({ error: 'Erro ao processar recuperação de senha' })
-  }
-})
+// Rota para processar a redefinição de senha
+app.post('/api/auth/redefinir-senha', async (req, res) => {
+    try {
+        const { token, novaSenha } = req.body;
+
+        // Verificar token
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        
+        // Hash da nova senha
+        const hashedPassword = await bcrypt.hash(novaSenha, 10);
+
+        // Atualizar senha no banco de dados
+        const result = await pool.query(
+            'UPDATE usuarios SET senha = $1 WHERE id = $2 RETURNING *',
+            [hashedPassword, decoded.id]
+        );
+        
+        if (result.rows.length === 0) {
+            return res.status(400).json({ error: 'Token inválido ou expirado' });
+        }
+
+        res.json({ message: 'Senha redefinida com sucesso' });
+    } catch (error) {
+        console.error('Erro ao redefinir senha:', error);
+        res.status(400).json({ error: 'Token inválido ou expirado' });
+    }
+});
 
 // Rotas da aplicação
 app.get('/login', (req, res) => {
   res.render('login', { title: 'Login' })
 })
 
-app.get('/dashboard', verificarToken, async (req, res) => {
+app.get('/dashboard', async (req, res) => {
   try {
     const userResult = await pool.query(
       'SELECT id, nome, matricula, email, tipo_usuario FROM usuarios WHERE id = $1',
@@ -264,7 +378,7 @@ app.get('/dashboard', verificarToken, async (req, res) => {
 })
 
 // Rotas protegidas para admin
-app.get('/admin/salas', verificarToken, async (req, res) => {
+app.get('/admin/salas', async (req, res) => {
   if (req.user.tipo !== 'admin') {
     return res.status(403).json({ error: 'Acesso negado' })
   }
@@ -276,7 +390,7 @@ app.get('/admin/salas', verificarToken, async (req, res) => {
   }
 })
 
-app.get('/admin/reservas', verificarToken, async (req, res) => {
+app.get('/admin/reservas', async (req, res) => {
   if (req.user.tipo !== 'admin') {
     return res.status(403).json({ error: 'Acesso negado' })
   }
@@ -295,7 +409,7 @@ app.get('/admin/reservas', verificarToken, async (req, res) => {
 })
 
 // Rotas para usuários comuns
-app.get('/minhas-reservas', verificarToken, async (req, res) => {
+app.get('/minhas-reservas', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT r.*, s.nome as sala_nome 
@@ -316,7 +430,7 @@ app.get('/minhas-reservas', verificarToken, async (req, res) => {
 })
 
 // Rotas das Views
-app.get('/salas', verificarToken, async (req, res) => {
+app.get('/salas', async (req, res) => {
   try {
     const salas = await pool.query('SELECT * FROM salas')
     res.render('pages/sala/index', { 
@@ -330,7 +444,7 @@ app.get('/salas', verificarToken, async (req, res) => {
   }
 })
 
-app.get('/reservas', verificarToken, async (req, res) => {
+app.get('/reservas', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT r.*, s.nome as sala_nome, u.nome as usuario_nome 
@@ -354,7 +468,7 @@ app.get('/reservas', verificarToken, async (req, res) => {
   }
 })
 
-app.get('/nova-reserva', verificarToken, async (req, res) => {
+app.get('/nova-reserva', async (req, res) => {
   try {
     const salas = await pool.query('SELECT * FROM salas')
     res.render('nova-reserva', { 
@@ -472,7 +586,7 @@ app.get('/nova-reserva', verificarToken, async (req, res) => {
  *               items:
  *                 $ref: '#/components/schemas/Sala'
  */
-app.get('/api/salas', verificarToken, async (req, res) => {
+app.get('/api/salas', async (req, res) => {
     try {
         const result = await pool.query('SELECT * FROM salas ORDER BY nome');
         console.log('Salas encontradas:', result.rows); // Debug
@@ -513,7 +627,7 @@ app.get('/api/salas', verificarToken, async (req, res) => {
  *             schema:
  *               $ref: '#/components/schemas/Sala'
  */
-app.post('/api/salas', verificarToken, async (req, res) => {
+app.post('/api/salas', async (req, res) => {
     try {
         const { nome, capacidade, recursos } = req.body;
         console.log('Dados recebidos:', { nome, capacidade, recursos }); // Debug
@@ -552,7 +666,7 @@ app.post('/api/salas', verificarToken, async (req, res) => {
  *               items:
  *                 $ref: '#/components/schemas/Reserva'
  */
-app.get('/api/reservas', verificarToken, async (req, res) => {
+app.get('/api/reservas', async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT r.*, s.nome as sala_nome, u.nome as usuario_nome 
@@ -567,7 +681,7 @@ app.get('/api/reservas', verificarToken, async (req, res) => {
   }
 })
 
-app.get('/api/reservas/minhas', verificarToken, async (req, res) => {
+app.get('/api/reservas/minhas', async (req, res) => {
     try {
         const result = await pool.query(`
             SELECT r.*, s.nome as sala_nome 
@@ -625,7 +739,7 @@ app.get('/api/reservas/minhas', verificarToken, async (req, res) => {
  *       400:
  *         description: Sala já está reservada neste período
  */
-app.post('/api/reservas', verificarToken, async (req, res) => {
+app.post('/api/reservas', async (req, res) => {
   const { sala_id, data_inicio, data_fim, motivo } = req.body
   try {
     const verificarDisponibilidade = await pool.query(
@@ -678,33 +792,46 @@ app.post('/api/reservas', verificarToken, async (req, res) => {
  *       404:
  *         description: Reserva não encontrada
  */
-app.put('/api/reservas/:id/cancelar', verificarToken, async (req, res) => {
+app.put('/api/reservas/:id/cancelar', async (req, res) => {
   const { id } = req.params
   try {
-    // Primeiro verifica se a reserva existe e pertence ao usuário
+    console.log('Tentando cancelar reserva:', id);
+    console.log('Usuário atual:', req.user);
+
+    // Verifica se a reserva existe
     const verificarReserva = await pool.query(
-      'SELECT * FROM reservas WHERE id = $1 AND usuario_id = $2',
-      [id, req.user.id]
+      'SELECT * FROM reservas WHERE id = $1',
+      [id]
     )
 
     if (verificarReserva.rows.length === 0) {
-      return res.status(404).json({ error: 'Reserva não encontrada ou você não tem permissão para cancelá-la' })
+      console.log('Reserva não encontrada');
+      return res.status(404).json({ error: 'Reserva não encontrada' })
     }
 
-    // Se a reserva existe e pertence ao usuário, cancela
+    // Se o usuário não for admin, verifica se é o dono da reserva
+    if (req.user.tipo !== 'admin') {
+      if (verificarReserva.rows[0].usuario_id !== req.user.id) {
+        console.log('Usuário não tem permissão para cancelar esta reserva');
+        return res.status(403).json({ error: 'Você não tem permissão para cancelar esta reserva' })
+      }
+    }
+
+    // Cancela a reserva
     const result = await pool.query(
-      'UPDATE reservas SET status = $1 WHERE id = $2 AND usuario_id = $3 RETURNING *',
-      ['cancelada', id, req.user.id]
+      'UPDATE reservas SET status = $1 WHERE id = $2 RETURNING *',
+      ['cancelada', id]
     )
     
+    console.log('Reserva cancelada com sucesso:', result.rows[0]);
     res.json(result.rows[0])
   } catch (error) {
-    console.error('Erro ao cancelar reserva:', error)
-    res.status(500).json({ error: 'Erro interno do servidor' })
+    console.error('Erro detalhado ao cancelar reserva:', error);
+    res.status(500).json({ error: 'Erro ao cancelar reserva: ' + error.message })
   }
 })
 
-app.put('/api/salas/:id', verificarToken, async (req, res) => {
+app.put('/api/salas/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const { nome, capacidade, recursos } = req.body;
@@ -729,7 +856,7 @@ app.put('/api/salas/:id', verificarToken, async (req, res) => {
     }
 });
 
-app.delete('/api/salas/:id', verificarToken, async (req, res) => {
+app.delete('/api/salas/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const result = await pool.query('DELETE FROM salas WHERE id = $1 RETURNING *', [id]);
@@ -745,7 +872,7 @@ app.delete('/api/salas/:id', verificarToken, async (req, res) => {
     }
 });
 
-app.get('/api/salas/:id', verificarToken, async (req, res) => {
+app.get('/api/salas/:id', async (req, res) => {
     try {
         const { id } = req.params;
         const result = await pool.query('SELECT * FROM salas WHERE id = $1', [id]);
@@ -761,7 +888,7 @@ app.get('/api/salas/:id', verificarToken, async (req, res) => {
     }
 });
 
-app.get('/api/reservas/:id', verificarToken, async (req, res) => {
+app.get('/api/reservas/:id', async (req, res) => {
     try {
         const result = await pool.query(
             `SELECT r.*, s.nome as sala_nome, u.nome as usuario_nome 

@@ -197,17 +197,30 @@
             fetch(`/api/reservas/${reservaId}/cancelar`, {
                 method: 'PUT',
                 headers: {
-                    'Authorization': `Bearer ${token}`
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
                 }
             })
             .then(response => {
-                if (!response.ok) throw new Error('Erro ao cancelar reserva');
-                bootstrap.Modal.getInstance(document.getElementById('modalReserva')).hide();
+                if (!response.ok) {
+                    return response.json().then(data => {
+                        throw new Error(data.error || 'Erro ao cancelar reserva');
+                    });
+                }
+                return response.json();
+            })
+            .then(data => {
+                // Verifica se o modal está aberto antes de tentar fechá-lo
+                const modal = bootstrap.Modal.getInstance(document.getElementById('modalReserva'));
+                if (modal) {
+                    modal.hide();
+                }
                 carregarReservas();
+                alert('Reserva cancelada com sucesso!');
             })
             .catch(error => {
                 console.error('Erro:', error);
-                alert('Erro ao cancelar reserva');
+                alert(error.message || 'Erro ao cancelar reserva');
             });
         }
 
